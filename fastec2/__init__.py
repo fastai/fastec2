@@ -10,6 +10,15 @@ from pdb import set_trace
 
 here = os.path.abspath(os.path.dirname(__file__)) + '/'
 
+def _boto3_repr(self):
+    if self.__class__.__name__ == 'ec2.Instance':
+        name = get_dict(self.tags)['Name']
+        return f'{name} ({self.id} {self.state["Name"]}): {self.public_ip_address or "No public IP"}'
+    else:
+        identifiers = [f'{ident}={repr(getattr(self, ident))}' for ident in self.meta.identifiers]
+        return f"{self.__class__.__name__}({', '.join(identifiers)})"
+boto3.resources.base.ServiceResource.__repr__ = _boto3_repr
+
 def listify(p=None, q=None):
     "Make `p` listy and the same length as `q`."
     if p is None: p=[]
@@ -20,9 +29,12 @@ def listify(p=None, q=None):
     assert len(p)==n, f'List len mismatch ({len(p)} vs {n})'
     return list(p)
 
-def get_dict(l): return collections.defaultdict(None, {o['Key']:o['Value'] for o in l})
+def get_dict(l): return collections.defaultdict(str, {o['Key']:o['Value'] for o in l})
 def make_dict(d:Dict):   return [{'Key':k, 'Value':  v } for k,v in (d or {}).items()]
-def make_filter(d:Dict): return [{'Name':k, 'Values':[v]} for k,v in (d or {}).items()]
+
+def make_filter(d:Dict):
+    d = {k.replace('_','-'):v for k,v in d.items()}
+    return {'Filters': [{'Name':k, 'Values':listify(v)} for k,v in (d or {}).items()]}
 
 def result(r):
     if isinstance(r, typing.List): r = r[0]
@@ -50,6 +62,15 @@ class EC2():
         self._ec2r = boto3.resource('ec2')
         self.insttypes = get_insttypes()
 
+    def _resources(self, coll_name, **filters):
+        coll = getattr(self._ec2r,coll_name)
+        return coll.filter(**make_filter(filters))
+
+    def resource(self, coll_name, **filters):
+        "The first resource from collection `coll_name` matching `filters`"
+        try: return next(iter(self._resources(coll_name, **filters)))
+        except StopIteration: raise KeyError(f'Resource not found: {coll_name}; {filters}') from None
+
     def get_region(self, region:str):
         "Get first region containing substring `region`"
         regions = get_regions()
@@ -58,13 +79,12 @@ class EC2():
 
     def _describe(self, f:str, d:Dict=None, **kwargs):
         "Calls `describe_{f}` with filter `d` and `kwargs`"
-        return result(getattr(self._ec2, 'describe_'+f)(Filters=make_filter(d), **kwargs))
+        return result(getattr(self._ec2, 'describe_'+f)(**make_filter(d), **kwargs))
 
-    def get_instances(self):
-        "Get names of (running,stopped) instances"
-        insts = [o['Instances'][0] for o in self._describe('instances')]
-        return [[get_dict(o['Tags'])['Name'] for o in insts if o['State']['Name']==p]
-                for p in ('running','stopped')]
+    def instances(self):
+        "Print all non-terminated instances"
+        states = ['pending', 'running', 'stopping', 'stopped']
+        for o in (self._resources('instances', instance_state_name=states)): print(o)
 
     def get_price_hist(self, insttype):
         types = self.insttypes[insttype]
@@ -89,44 +109,41 @@ class EC2():
         waiter.config.max_attempts = timeout//15
         waiter.wait(**filt)
 
-    def get_secgroup(self, secgroupname):
+    def _secgroup(self, secgroupname):
         "Get security group id from `secgroupname`, creating it if needed (with just port 22 ingress)"
-        secgroup = self._describe('security_groups', {'group-name':secgroupname})
-        if secgroup: return secgroup[0]['GroupId']
-        vpcid = self._describe('vpcs', {'isDefault':'true'})[0]['VpcId']
-        response = self._ec2.create_security_group(GroupName=secgroupname, Description=secgroupname, VpcId=vpcid)
-        secgroupid = response['GroupId']
-        self._ec2.authorize_security_group_ingress(GroupId=secgroupid, IpPermissions=[{
-            'IpRanges': [{'CidrIp': '0.0.0.0/0'}], 'FromPort': 22, 'ToPort': 22,
-            'IpProtocol': 'tcp'}] )
-        return secgroupid
+        try: secgroup = self.resource('security_groups', group_name=secgroupname)
+        except KeyError:
+            vpc = self.resource('vpcs', isDefault='true')
+            secgroup = self._ec2r.create_security_group(GroupName=secgroupname, Description=secgroupname, VpcId=vpc.id)
+            secgroup.authorize_ingress(IpPermissions=[{
+                'IpRanges': [{'CidrIp': '0.0.0.0/0'}], 'FromPort': 22, 'ToPort': 22,
+                'IpProtocol': 'tcp'}] )
+        return secgroup
 
     def _get_amis(self, name, owner, filt_func=None):
-        filters = {'description':name, 'owner-id':owner,
-            'architecture':'x86_64', 'virtualization-type':'hvm',
-            'state':'available', 'root-device-type':'ebs'}
-        amis = self._describe('images', filters)
-
-        if filt_func is not None: amis = [o for o in amis if filt_func(o)]
-        return sorted(amis, key=lambda o: parse(o['CreationDate']), reverse=True)
+        if filt_func is None: filt_func=lambda o:True
+        amis = self._resources('images', description=name, owner_id=owner, architecture='x86_64',
+                               virtualization_type='hvm', state='available', root_device_type='ebs')
+        amis = [o for o in amis if filt_func(o)]
+        return sorted(amis, key=lambda o: parse(o.creation_date), reverse=True)
 
     def get_ami(self, aminame=None):
         "Look up `aminame` if provided, otherwise find latest Ubuntu 18.04 image"
         # If passed a valid AMI id, just return it
-        if self._describe('images', {'image-id':aminame}): return aminame
-        if aminame: amis = self._describe('images', {'name': aminame, 'is-public':'false'})
-        else:
-            amis = self._get_amis('Canonical, Ubuntu, 18.04 LTS*','099720109477',
-                            lambda o: not re.search(r'UNSUPPORTED|minimal', o['Description']))
+        try: return self.resource('images', image_id=aminame)
+        except KeyError: pass
+        if aminame: return self.resource('images', name=aminame, is_public='false')
+        amis = self._get_amis('Canonical, Ubuntu, 18.04 LTS*','099720109477',
+                              lambda o: not re.search(r'UNSUPPORTED|minimal', o.description))
         assert amis, 'AMI not found'
-        return amis[0]['ImageId']
+        return amis[0]
 
     def _launch_spec(self, ami, keyname, disksize, instancetype, secgroupid, iops=None):
         assert self._describe('key_pairs', {'key-name':keyname}), 'default key not found'
         ami = self.get_ami(ami)
         ebs = ({'VolumeSize': disksize, 'VolumeType': 'io1', 'Iops': 6000 }
                  if iops else {'VolumeSize': disksize, 'VolumeType': 'gp2'})
-        return { 'ImageId': ami, 'InstanceType': instancetype,
+        return { 'ImageId': ami.id, 'InstanceType': instancetype,
             'SecurityGroupIds': [secgroupid], 'KeyName': keyname,
             "BlockDeviceMappings": [{ "DeviceName": "/dev/sda1", "Ebs": ebs, }] }
 
@@ -137,14 +154,15 @@ class EC2():
         srid = sr[0]['SpotInstanceRequestId']
         self.waitfor('spot_instance_request_fulfilled', 180, SpotInstanceRequestIds=[srid])
         time.sleep(5)
-        return self._describe('spot_instance_requests', {'spot-instance-request-id':srid})[0]['InstanceId']
+        instid = self._describe('spot_instance_requests', {'spot-instance-request-id':srid})[0]['InstanceId']
+        return self.resource('instances', instance_id=instid)
 
     def request_demand(self, ami, keyname, disksize, instancetype, secgroupid, iops=None):
         spec = self._launch_spec(ami, keyname, disksize, instancetype, secgroupid, iops)
-        return self._ec2.run_instances(MinCount=1, MaxCount=1, **spec)['Instances'][0]['InstanceId']
+        return self._ec2r.create_instances(MinCount=1, MaxCount=1, **spec)['Instances'][0]['InstanceId']
 
     def wait_ssh(self, inst):
-        self.waitfor('instance_running', 180, InstanceIds=[inst.instance_id])
+        self.waitfor('instance_running', 180, InstanceIds=[inst.id])
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             for i in range(720//5):
                 try:
@@ -153,25 +171,30 @@ class EC2():
                     return inst
                 except (ConnectionRefusedError,BlockingIOError): time.sleep(5)
 
-    def launch(self, name, ami, disksize, instancetype, keyname:str='default', secgroupname:str='ssh', iops:int=None, spot:bool=False):
+    def _launch(self, name, ami, disksize, instancetype, keyname:str='default', secgroupname:str='ssh', iops:int=None, spot:bool=False):
         insts = self._describe('instances', {'tag:Name':name})
         assert not insts, 'name already exists'
-        secgroupid = self.get_secgroup(secgroupname)
-        if spot: instid = self.request_spot  (ami, keyname, disksize, instancetype, secgroupid, iops)
-        else   : instid = self.request_demand(ami, keyname, disksize, instancetype, secgroupid, iops)
-        self._ec2.create_tags(Resources=[instid], Tags=make_dict({'Name':name}))
-        inst = self.wait_ssh(inst)
-        return inst.instance_id
+        secgroupid = self._secgroup(secgroupname).id
+        if spot: inst = self.request_spot  (ami, keyname, disksize, instancetype, secgroupid, iops)
+        else   : inst = self.request_demand(ami, keyname, disksize, instancetype, secgroupid, iops)
+        inst.create_tags(Tags=make_dict({'Name':name}))
+        return self.wait_ssh(inst)
+
+    def launch(self, name, ami, disksize, instancetype, keyname:str='default', secgroupname:str='ssh', iops:int=None, spot:bool=False):
+        return str(self._launch(name, ami, disksize, instancetype, keyname, secgroupname, iops, spot))
 
     def instance(self, name:str):
         filt = make_filter({'tag:Name':name})
-        return next(iter(self._ec2r.instances.filter(Filters=filt)))
+        return next(iter(self._ec2r.instances.filter(**filt)))
 
-    def start(self, name):
+    def show(self, name:str): return str(self.instance(name))
+
+    def _start(self, name):
         inst = self.instance(name)
         inst.start()
-        inst = self.wait_ssh(inst)
-        return inst.public_ip_address
+        return self.wait_ssh(inst)
+
+    def start(self, name): return str(self._start(name))
 
     def connect(self, name, user='ubuntu'):
         inst = self.instance(name)
