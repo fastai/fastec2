@@ -8,6 +8,8 @@ from dateutil.parser import parse
 from pkg_resources import resource_filename
 from pdb import set_trace
 
+__all__ = ['EC2', 'connect_ssh', 'main']
+
 here = os.path.abspath(os.path.dirname(__file__)) + '/'
 
 def _boto3_repr(self):
@@ -18,6 +20,12 @@ def _boto3_repr(self):
         identifiers = [f'{ident}={repr(getattr(self, ident))}' for ident in self.meta.identifiers]
         return f"{self.__class__.__name__}({', '.join(identifiers)})"
 boto3.resources.base.ServiceResource.__repr__ = _boto3_repr
+
+_in_notebook = False
+try:
+    from ipykernel.kernelapp import IPKernelApp
+    _in_notebook = IPKernelApp.initialized()
+except: pass
 
 def listify(p=None, q=None):
     "Make `p` listy and the same length as `q`."
@@ -96,13 +104,16 @@ class EC2():
 
     def price_hist(self, insttype):
         pv = self.get_price_hist(insttype)
-        pv.plot()
-        return pv.tail(3)
+        res = pv.tail(3).T
+        if _in_notebook:
+            pv.plot()
+            return res
+        print(res)
 
     def price_demand(self, insttype):
         "On demand prices for `insttype` (currently only shows us-east-1 prices)"
-        prices = dict(pd.read_csv('prices.csv').values)
-        return [(o,prices[o]) for o in self.insttypes[insttype]]
+        prices = dict(pd.read_csv(here+'prices.csv').values)
+        return [(o,round(prices[o],3)) for o in self.insttypes[insttype]]
 
     def waitfor(self, which, timeout, **filt):
         waiter = self._ec2.get_waiter(which)
@@ -138,6 +149,14 @@ class EC2():
         assert amis, 'AMI not found'
         return amis[0]
 
+    def change_type(self, name, insttype):
+        inst = self.instance(name)
+        inst.modify_attribute(Attribute='instanceType', Value=insttype)
+
+    def freeze(self, name):
+        inst = self.instance(name)
+        return self._ec2.create_image(InstanceId=inst.id, Name=name)['ImageId']
+
     def _launch_spec(self, ami, keyname, disksize, instancetype, secgroupid, iops=None):
         assert self._describe('key_pairs', {'key-name':keyname}), 'default key not found'
         ami = self.get_ami(ami)
@@ -155,11 +174,11 @@ class EC2():
         self.waitfor('spot_instance_request_fulfilled', 180, SpotInstanceRequestIds=[srid])
         time.sleep(5)
         instid = self._describe('spot_instance_requests', {'spot-instance-request-id':srid})[0]['InstanceId']
-        return self.resource('instances', instance_id=instid)
+        return self._ec2r.Instance(instid)
 
     def request_demand(self, ami, keyname, disksize, instancetype, secgroupid, iops=None):
         spec = self._launch_spec(ami, keyname, disksize, instancetype, secgroupid, iops)
-        return self._ec2r.create_instances(MinCount=1, MaxCount=1, **spec)['Instances'][0]['InstanceId']
+        return self._ec2r.create_instances(MinCount=1, MaxCount=1, **spec)[0]
 
     def wait_ssh(self, inst):
         self.waitfor('instance_running', 180, InstanceIds=[inst.id])
@@ -200,26 +219,27 @@ class EC2():
         inst = self.instance(name)
         os.execvp('ssh', ['ssh', f'{user}@{inst.public_ip_address}'])
 
-def connect_ssh(inst, user, keyfile):
-    keyfile = os.path.expanduser(keyfile)
-    key = paramiko.RSAKey.from_private_key_file(keyfile)
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(hostname=inst.public_ip_address, username=user, pkey=key)
-    return client
+    def ssh(self, name, user='ubuntu', keyfile='~/.ssh/id_rsa'):
+        inst = self.instance(name)
+        keyfile = os.path.expanduser(keyfile)
+        key = paramiko.RSAKey.from_private_key_file(keyfile)
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(hostname=inst.public_ip_address, username=user, pkey=key)
+        return client
 
-def _run_ssh(self, ssh, cmd, pty=False):
+def _run_ssh(ssh, cmd, pty=False):
     stdin, stdout, stderr = ssh.exec_command(cmd, get_pty=pty)
     stdout_str = stdout.read().decode()
     stderr_str = stderr.read().decode()
     if stdout.channel.recv_exit_status() != 0: raise Exception(stdout_str)
     return stdout_str, stderr_str
 
-def _check_ssh(self, ssh): assert run_ssh(ssh, 'echo hi')[0] == 'hi\n'
+def _check_ssh(ssh): assert ssh.run('echo hi')[0] == 'hi\n'
 
-def _send_tmux(self, ssh, cmd):
-    run_ssh(ssh, f'tmux send-keys -l {shlex.quote(cmd)}')
-    run_ssh(ssh, f'tmux send-keys Enter')
+def _send_tmux(ssh, cmd):
+    ssh.run(f'tmux send-keys -l {shlex.quote(cmd)}')
+    ssh.run(f'tmux send-keys Enter')
 
 paramiko.SSHClient.run = _run_ssh
 paramiko.SSHClient.check = _check_ssh

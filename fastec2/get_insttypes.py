@@ -16,7 +16,7 @@ with open('insttypes.txt', 'w') as f:
     for o in s: f.write(o+'\n')
 
 prices = df[(df['TermType']=='OnDemand') & (df['PricePerUnit']>0) & (df['Tenancy']=='Shared')
-            & (df['Operating System']=='Linux')  & (df['CapacityStatus']=='Used')]
+             & pd.isna(df['Pre Installed S/W']) & (df['Operating System']=='Linux')  & (df['CapacityStatus']=='Used')]
 
 prices[['Instance Type', 'PricePerUnit']].to_csv('prices.csv', index=False)
 
