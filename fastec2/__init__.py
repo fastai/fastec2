@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 
 import numpy as np, pandas as pd
-import boto3, re, time, typing, socket, paramiko, os, pysftp, collections, json, fire, shlex
+import boto3, re, time, typing, socket, paramiko, os, pysftp, collections, json, fire, shlex, sys, inspect
 from typing import Callable,List,Dict,Tuple,Union,Optional,Iterable
 from pathlib import Path
 from dateutil.parser import parse
 from pkg_resources import resource_filename
 from pdb import set_trace
 
-__all__ = ['EC2', 'main']
+__all__ = 'EC2 main make_filter listify'.split()
 
 here = os.path.abspath(os.path.dirname(__file__)) + '/'
 
@@ -50,18 +50,18 @@ def make_filter(d:Dict):
     d = {k.replace('_','-'):v for k,v in d.items()}
     return {'Filters': [{'Name':k, 'Values':listify(v)} for k,v in (d or {}).items()]}
 
-def result(r):
+def _result(r):
     if isinstance(r, typing.List): r = r[0]
     k = [o for o in r.keys() if r !='ResponseMetadata']
     if not k: return None
     return r[k[0]]
 
-def get_regions():
+def _get_regions():
     endpoint_file = resource_filename('botocore', 'data/endpoints.json')
     with open(endpoint_file, 'r') as f: a = json.load(f)
     return {k:v['description'] for k,v in a['partitions'][0]['regions'].items()}
 
-def get_insttypes():
+def _get_insttypes():
     "Dict of instance types (eg 'p3.8xlarge') for each instance category (eg 'p3')"
     s = [o.strip() for o in open(here+'insttypes.txt').readlines()]
     d = collections.defaultdict(list)
@@ -71,10 +71,13 @@ def get_insttypes():
 
 class EC2():
     def __init__(self, region:str=None):
-        if region is not None: boto3.setup_default_session(region_name=region)
+        self.curr_region = ''
+        if region:
+            self.curr_region = self.region(region)
+            boto3.setup_default_session(region_name=self.curr_region)
         self._ec2 = boto3.client('ec2')
         self._ec2r = boto3.resource('ec2')
-        self.insttypes = get_insttypes()
+        self.insttypes = _get_insttypes()
 
     def _resources(self, coll_name, **filters):
         coll = getattr(self._ec2r,coll_name)
@@ -87,13 +90,13 @@ class EC2():
 
     def region(self, region:str):
         "Get first region containing substring `region`"
-        regions = get_regions()
+        regions = _get_regions()
         if region in regions: return region
         return next(r for r,n in regions.items() if region in n)
 
     def _describe(self, f:str, d:Dict=None, **kwargs):
         "Calls `describe_{f}` with filter `d` and `kwargs`"
-        return result(getattr(self._ec2, 'describe_'+f)(**make_filter(d), **kwargs))
+        return _result(getattr(self._ec2, 'describe_'+f)(**make_filter(d), **kwargs))
 
     def instances(self):
         "Print all non-terminated instances"
@@ -187,7 +190,7 @@ class EC2():
 
     def request_spot(self, ami, keyname, disksize, instancetype, secgroupid, iops=None):
         spec = self._launch_spec(ami, keyname, disksize, instancetype, secgroupid, iops)
-        sr = result(self._ec2.request_spot_instances(LaunchSpecification=spec))
+        sr = _result(self._ec2.request_spot_instances(LaunchSpecification=spec))
         assert len(sr)==1, 'spot request failed'
         srid = sr[0]['SpotInstanceRequestId']
         self.waitfor('spot_instance_request_fulfilled', 180, SpotInstanceRequestIds=[srid])
@@ -206,7 +209,6 @@ class EC2():
                 try:
                     s.connect((inst.public_ip_address, 22))
                     time.sleep(1)
-                    return inst
                 except (ConnectionRefusedError,BlockingIOError): time.sleep(5)
 
     def get_launch(self, name, ami, disksize, instancetype, keyname:str='default', secgroupname:str='ssh', iops:int=None, spot:bool=False):
@@ -224,24 +226,28 @@ class EC2():
 
     def get_instance(self, name:str):
         "Get `Instance` object for `name`"
+        if name.__class__.__name__ == 'ec2.Instance': return name
         filt = make_filter({'tag:Name':name})
         return next(iter(self._ec2r.instances.filter(**filt)))
 
-    def instance(self, name:str): print(self.get_instance(name))
+    def instance(self, name:str):
+        "Show `Instance` details for `name`"
+        print(self.get_instance(name))
 
-    def get_start(self, name):
-        "Starts instance `name` and returns `Instance` object"
+    def start(self, name, show=True):
+        "Starts instance `name`"
         inst = self.get_instance(name)
         inst.start()
-        return self._wait_ssh(inst)
+        self._wait_ssh(inst)
+        if show: print(inst)
+        else: return inst
 
-    def start(self, name): print(self.get_start(name))
-
-    def connect(self, name, ports=None):
+    def connect(self, name, ports=None, user=None):
         """Replace python process with an ssh process connected to instance `name`;
         use `user@name` otherwise defaults to user 'ubuntu'. `ports` (int or list) creates tunnels"""
-        if '@' in name: user,name = name.split('@')
-        else: user = 'ubuntu'
+        if user is None:
+            if isinstance(name,str) and '@' in name: user,name = name.split('@')
+            else: user = 'ubuntu'
         inst = self.get_instance(name)
         tunnel = []
         if ports is not None: tunnel = [f'-L {o}:localhost:{o}' for o in listify(ports)]
@@ -259,6 +265,37 @@ class EC2():
         client.launch_tmux()
         return client
 
+    def script(self, scriptname, name, ip, myip=None):
+        conf_fn = 'fastec2/sync.conf'
+        if myip is None:
+            myip = subprocess.check_output(['curl', 'https://ipinfo.io/ip']).decode().strip()
+
+        sync_tmpl = """
+settings {{
+   logfile    = "/tmp/lsyncd.log",
+   statusFile = "/tmp/lsyncd.status",
+}}
+sync {{
+   default.rsync,
+   delete = false,
+   source = "fastec2/{name}",
+   target = "{myip}:fastec2/{name}"
+}}"""
+
+        path = Path.home()/'fastec2'/name
+        path.mkdir(parents=True, exist_ok=True)
+        shutil.copy(fn, path)
+
+        ssh = ec2.ssh(inst, user, keyfile)
+        ssh.send('mkdir -p ~/fastec2')
+        ssh.send(f'echo {name} > ~/fastec2/current')
+        ssh.send(f'ssh-keyscan {srcip} >> ~/.ssh/known_hosts')
+        os.system(f"rsync -az {path} {user}@{ip}:fastec2/")
+        ssh.send(f'cd {path}')
+        ssh.write(conf_fn, sync_tmpl.format(name=name, ip=myip))
+        ssh.send(f'lsyncd {conf_fn} -pidfile /tmp/lsyncd.pid')
+        os.execvp('./'+scriptname)
+
 def _run_ssh(ssh, cmd, pty=False):
     stdin, stdout, stderr = ssh.exec_command(cmd, get_pty=pty)
     stdout_str = stdout.read().decode()
@@ -270,6 +307,8 @@ def _run_ssh(ssh, cmd, pty=False):
     return stdout_str,stderr_str
 
 def _check_ssh(ssh): assert ssh.run('echo hi')[0] == 'hi\n'
+
+def _write_ssh(ssh, fn, s): ssh.open_sftp().open(fn, 'w').write(s)
 
 def _launch_tmux(ssh):
     try: ssh.run('tmux ls')
@@ -283,6 +322,7 @@ def _send_tmux(ssh, cmd):
 paramiko.SSHClient.run = _run_ssh
 paramiko.SSHClient.check = _check_ssh
 paramiko.SSHClient.send = _send_tmux
+paramiko.SSHClient.write = _write_ssh
 paramiko.SSHClient.launch_tmux = _launch_tmux
 
 def _pysftp_init(self, transport):
@@ -302,6 +342,13 @@ pysftp.Connection.__init__ = _pysftp_init
 pysftp.Connection.put_dir = _put_dir
 pysftp.Connection.put_key = _put_key
 
-def main(): fire.Fire(EC2)
+def interact(region=''):
+    os.execvp('ipython', ['ipython', '--autocall=2', '-ic',
+                          f'import fastec2; e=fastec2.EC2("{region}")'])
+
+def main():
+    if len(sys.argv)>=2 and sys.argv[1]=='i': interact(*sys.argv[2:])
+    else: fire.Fire(EC2)
+
 if __name__ == '__main__': main()
 
