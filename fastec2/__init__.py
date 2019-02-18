@@ -1,21 +1,30 @@
 #!/usr/bin/env python
 
 import numpy as np, pandas as pd
-import boto3, re, time, typing, socket, paramiko, os, pysftp, collections, json, fire
+import boto3, re, time, typing, socket, paramiko, os, pysftp, collections, json, fire, shlex
 from typing import Callable,List,Dict,Tuple,Union,Optional,Iterable
 from pathlib import Path
 from dateutil.parser import parse
 from pkg_resources import resource_filename
 from pdb import set_trace
 
-__all__ = ['EC2', 'connect_ssh', 'main']
+__all__ = ['EC2', 'main']
 
 here = os.path.abspath(os.path.dirname(__file__)) + '/'
 
+def _get_dict(l): return collections.defaultdict(str, {o['Key']:o['Value'] for o in l})
+def _make_dict(d:Dict):   return [{'Key':k, 'Value':  v } for k,v in (d or {}).items()]
+
+boto3.resources.base.ServiceResource.name = property(
+    lambda o: _get_dict(o.tags)['Name'])
+
 def _boto3_repr(self):
-    if self.__class__.__name__ == 'ec2.Instance':
-        name = get_dict(self.tags)['Name']
-        return f'{name} ({self.id} {self.state["Name"]}): {self.public_ip_address or "No public IP"}'
+    clname =  self.__class__.__name__
+    if clname == 'ec2.Instance':
+        return f'{self.name} ({self.id} {self.instance_type} {self.state["Name"]}): {self.public_ip_address or "No public IP"}'
+    elif clname == 'ec2.Image':
+        root_dev = [o for o in self.block_device_mappings if self.root_device_name == o['DeviceName']]
+        return f'{self.name} ({self.id}): {root_dev[0]["Ebs"]["VolumeSize"]}GB'
     else:
         identifiers = [f'{ident}={repr(getattr(self, ident))}' for ident in self.meta.identifiers]
         return f"{self.__class__.__name__}({', '.join(identifiers)})"
@@ -36,9 +45,6 @@ def listify(p=None, q=None):
     if len(p)==1: p = p * n
     assert len(p)==n, f'List len mismatch ({len(p)} vs {n})'
     return list(p)
-
-def get_dict(l): return collections.defaultdict(str, {o['Key']:o['Value'] for o in l})
-def make_dict(d:Dict):   return [{'Key':k, 'Value':  v } for k,v in (d or {}).items()]
 
 def make_filter(d:Dict):
     d = {k.replace('_','-'):v for k,v in d.items()}
@@ -79,11 +85,11 @@ class EC2():
         try: return next(iter(self._resources(coll_name, **filters)))
         except StopIteration: raise KeyError(f'Resource not found: {coll_name}; {filters}') from None
 
-    def get_region(self, region:str):
+    def region(self, region:str):
         "Get first region containing substring `region`"
         regions = get_regions()
         if region in regions: return region
-        return next(r for r,n in get_regions().items() if region in n)
+        return next(r for r,n in regions.items() if region in n)
 
     def _describe(self, f:str, d:Dict=None, **kwargs):
         "Calls `describe_{f}` with filter `d` and `kwargs`"
@@ -94,7 +100,7 @@ class EC2():
         states = ['pending', 'running', 'stopping', 'stopped']
         for o in (self._resources('instances', instance_state_name=states)): print(o)
 
-    def get_price_hist(self, insttype):
+    def _price_hist(self, insttype):
         types = self.insttypes[insttype]
         prices = self._ec2.describe_spot_price_history(InstanceTypes=types, ProductDescriptions=["Linux/UNIX"])
         df = pd.DataFrame(prices['SpotPriceHistory'])
@@ -103,7 +109,7 @@ class EC2():
                              ).resample('1D').min().reindex(columns=types).tail(50)
 
     def price_hist(self, insttype):
-        pv = self.get_price_hist(insttype)
+        pv = self._price_hist(insttype)
         res = pv.tail(3).T
         if _in_notebook:
             pv.plot()
@@ -120,7 +126,7 @@ class EC2():
         waiter.config.max_attempts = timeout//15
         waiter.wait(**filt)
 
-    def _secgroup(self, secgroupname):
+    def get_secgroup(self, secgroupname):
         "Get security group id from `secgroupname`, creating it if needed (with just port 22 ingress)"
         try: secgroup = self.resource('security_groups', group_name=secgroupname)
         except KeyError:
@@ -131,12 +137,23 @@ class EC2():
                 'IpProtocol': 'tcp'}] )
         return secgroup
 
-    def _get_amis(self, name, owner, filt_func=None):
+    def get_amis(self, description=None, owner=None, filt_func=None):
+        """Return all AMIs with `owner` (or private AMIs if None), optionally matching `description` and `filt_func`.
+        Sorted by `creation_date` descending"""
         if filt_func is None: filt_func=lambda o:True
-        amis = self._resources('images', description=name, owner_id=owner, architecture='x86_64',
-                               virtualization_type='hvm', state='available', root_device_type='ebs')
+        filt = dict(architecture='x86_64', virtualization_type='hvm', state='available', root_device_type='ebs')
+        if owner is None: filt['is_public'] = 'false'
+        else:             filt['owner-id'] = owner
+        if description is not None: filt['description'] = description
+        print(filt)
+        amis = self._resources('images', **filt)
         amis = [o for o in amis if filt_func(o)]
         return sorted(amis, key=lambda o: parse(o.creation_date), reverse=True)
+
+    def amis(self, description=None, owner=None, filt_func=None):
+        """Return all AMIs with `owner` (or private AMIs if None), optionally matching `description` and `filt_func`.
+        Sorted by `creation_date` descending"""
+        for ami in self.get_amis(description, owner, filt_func): print(ami)
 
     def get_ami(self, aminame=None):
         "Look up `aminame` if provided, otherwise find latest Ubuntu 18.04 image"
@@ -144,17 +161,19 @@ class EC2():
         try: return self.resource('images', image_id=aminame)
         except KeyError: pass
         if aminame: return self.resource('images', name=aminame, is_public='false')
-        amis = self._get_amis('Canonical, Ubuntu, 18.04 LTS*','099720109477',
-                              lambda o: not re.search(r'UNSUPPORTED|minimal', o.description))
+        amis = self.get_amis('Canonical, Ubuntu, 18.04 LTS*',owner='099720109477',
+                              filt_func=lambda o: not re.search(r'UNSUPPORTED|minimal', o.description))
         assert amis, 'AMI not found'
         return amis[0]
 
+    def ami(self, aminame=None): print(self.get_ami(aminame))
+
     def change_type(self, name, insttype):
-        inst = self.instance(name)
+        inst = self.get_instance(name)
         inst.modify_attribute(Attribute='instanceType', Value=insttype)
 
     def freeze(self, name):
-        inst = self.instance(name)
+        inst = self.get_instance(name)
         return self._ec2.create_image(InstanceId=inst.id, Name=name)['ImageId']
 
     def _launch_spec(self, ami, keyname, disksize, instancetype, secgroupid, iops=None):
@@ -180,7 +199,7 @@ class EC2():
         spec = self._launch_spec(ami, keyname, disksize, instancetype, secgroupid, iops)
         return self._ec2r.create_instances(MinCount=1, MaxCount=1, **spec)[0]
 
-    def wait_ssh(self, inst):
+    def _wait_ssh(self, inst):
         self.waitfor('instance_running', 180, InstanceIds=[inst.id])
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             for i in range(720//5):
@@ -190,52 +209,72 @@ class EC2():
                     return inst
                 except (ConnectionRefusedError,BlockingIOError): time.sleep(5)
 
-    def _launch(self, name, ami, disksize, instancetype, keyname:str='default', secgroupname:str='ssh', iops:int=None, spot:bool=False):
+    def get_launch(self, name, ami, disksize, instancetype, keyname:str='default', secgroupname:str='ssh', iops:int=None, spot:bool=False):
+        "Creates new instance `name` and returns `Instance` object"
         insts = self._describe('instances', {'tag:Name':name})
         assert not insts, 'name already exists'
-        secgroupid = self._secgroup(secgroupname).id
+        secgroupid = self.get_secgroup(secgroupname).id
         if spot: inst = self.request_spot  (ami, keyname, disksize, instancetype, secgroupid, iops)
         else   : inst = self.request_demand(ami, keyname, disksize, instancetype, secgroupid, iops)
-        inst.create_tags(Tags=make_dict({'Name':name}))
-        return self.wait_ssh(inst)
+        inst.create_tags(Tags=_make_dict({'Name':name}))
+        self._wait_ssh(inst)
 
     def launch(self, name, ami, disksize, instancetype, keyname:str='default', secgroupname:str='ssh', iops:int=None, spot:bool=False):
-        return str(self._launch(name, ami, disksize, instancetype, keyname, secgroupname, iops, spot))
+        print(self.get_launch(name, ami, disksize, instancetype, keyname, secgroupname, iops, spot))
 
-    def instance(self, name:str):
+    def get_instance(self, name:str):
+        "Get `Instance` object for `name`"
         filt = make_filter({'tag:Name':name})
         return next(iter(self._ec2r.instances.filter(**filt)))
 
-    def show(self, name:str): return str(self.instance(name))
+    def instance(self, name:str): print(self.get_instance(name))
 
-    def _start(self, name):
-        inst = self.instance(name)
+    def get_start(self, name):
+        "Starts instance `name` and returns `Instance` object"
+        inst = self.get_instance(name)
         inst.start()
-        return self.wait_ssh(inst)
+        return self._wait_ssh(inst)
 
-    def start(self, name): return str(self._start(name))
+    def start(self, name): print(self.get_start(name))
 
-    def connect(self, name, user='ubuntu'):
-        inst = self.instance(name)
-        os.execvp('ssh', ['ssh', f'{user}@{inst.public_ip_address}'])
+    def connect(self, name, ports=None):
+        """Replace python process with an ssh process connected to instance `name`;
+        use `user@name` otherwise defaults to user 'ubuntu'. `ports` (int or list) creates tunnels"""
+        if '@' in name: user,name = name.split('@')
+        else: user = 'ubuntu'
+        inst = self.get_instance(name)
+        tunnel = []
+        if ports is not None: tunnel = [f'-L {o}:localhost:{o}' for o in listify(ports)]
+        os.execvp('ssh', ['ssh', f'{user}@{inst.public_ip_address}', *tunnel])
 
     def ssh(self, name, user='ubuntu', keyfile='~/.ssh/id_rsa'):
-        inst = self.instance(name)
+        "Return a paramiko ssh connection objected connected to instance `name`"
+        inst = self.get_instance(name)
         keyfile = os.path.expanduser(keyfile)
         key = paramiko.RSAKey.from_private_key_file(keyfile)
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(hostname=inst.public_ip_address, username=user, pkey=key)
+        client.raise_stderr = True
+        client.launch_tmux()
         return client
 
 def _run_ssh(ssh, cmd, pty=False):
     stdin, stdout, stderr = ssh.exec_command(cmd, get_pty=pty)
     stdout_str = stdout.read().decode()
     stderr_str = stderr.read().decode()
-    if stdout.channel.recv_exit_status() != 0: raise Exception(stdout_str)
-    return stdout_str, stderr_str
+    if stdout.channel.recv_exit_status() != 0: raise Exception(stderr_str)
+    if ssh.raise_stderr:
+        if stderr_str: raise Exception(stderr_str)
+        return stdout_str
+    return stdout_str,stderr_str
 
 def _check_ssh(ssh): assert ssh.run('echo hi')[0] == 'hi\n'
+
+def _launch_tmux(ssh):
+    try: ssh.run('tmux ls')
+    except: ssh.run('tmux new -n 0 -d', pty=True)
+    return ssh
 
 def _send_tmux(ssh, cmd):
     ssh.run(f'tmux send-keys -l {shlex.quote(cmd)}')
@@ -244,6 +283,7 @@ def _send_tmux(ssh, cmd):
 paramiko.SSHClient.run = _run_ssh
 paramiko.SSHClient.check = _check_ssh
 paramiko.SSHClient.send = _send_tmux
+paramiko.SSHClient.launch_tmux = _launch_tmux
 
 def _pysftp_init(self, transport):
     self._sftp_live = True
