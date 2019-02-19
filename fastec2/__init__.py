@@ -243,6 +243,16 @@ class EC2():
         if show: print(inst)
         else: return inst
 
+    def terminate(self, name):
+        "Starts instance `name`"
+        inst = self.get_instance(name)
+        inst.terminate()
+        self._ec2.delete_tags(Resources=[inst.id],Tags=[{"Key": 'Name'}])
+
+    def stop(self, name):
+        "Stops instance `name`"
+        self.get_instance(name).stop()
+
     def connect(self, name, ports=None, user=None):
         """Replace python process with an ssh process connected to instance `name`;
         use `user@name` otherwise defaults to user 'ubuntu'. `ports` (int or list) creates tunnels"""
