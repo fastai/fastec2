@@ -193,7 +193,9 @@ class EC2():
         sr = _result(self._ec2.request_spot_instances(LaunchSpecification=spec))
         assert len(sr)==1, 'spot request failed'
         srid = sr[0]['SpotInstanceRequestId']
-        self.waitfor('spot_instance_request_fulfilled', 180, SpotInstanceRequestIds=[srid])
+        try: self.waitfor('spot_instance_request_fulfilled', 180, SpotInstanceRequestIds=[srid])
+        except: raise Exception(self._describe('spot_instance_requests',
+                {'spot-instance-request-id':srid})[0]['Fault']['Message']) from None
         time.sleep(5)
         instid = self._describe('spot_instance_requests', {'spot-instance-request-id':srid})[0]['InstanceId']
         return self._ec2r.Instance(instid)
