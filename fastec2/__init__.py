@@ -149,7 +149,6 @@ class EC2():
         if owner is None: filt['is_public'] = 'false'
         else:             filt['owner-id'] = owner
         if description is not None: filt['description'] = description
-        print(filt)
         amis = self._resources('images', **filt)
         amis = [o for o in amis if filt_func(o)]
         return sorted(amis, key=lambda o: parse(o.creation_date), reverse=True)
@@ -221,7 +220,7 @@ class EC2():
         if spot: inst = self.request_spot  (ami, keyname, disksize, instancetype, secgroupid, iops)
         else   : inst = self.request_demand(ami, keyname, disksize, instancetype, secgroupid, iops)
         inst.create_tags(Tags=_make_dict({'Name':name}))
-        self._wait_ssh(inst)
+        return self._wait_ssh(inst)
 
     def launch(self, name, ami, disksize, instancetype, keyname:str='default', secgroupname:str='ssh', iops:int=None, spot:bool=False):
         print(self.get_launch(name, ami, disksize, instancetype, keyname, secgroupname, iops, spot))
