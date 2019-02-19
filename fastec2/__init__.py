@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 
 import numpy as np, pandas as pd
-import boto3, re, time, typing, socket, paramiko, os, pysftp, collections, json, fire, shlex, sys, inspect
+import boto3, re, time, typing, socket, paramiko, os, pysftp, collections, json, fire, shlex, sys
+import inspect, subprocess, shutil
 from typing import Callable,List,Dict,Tuple,Union,Optional,Iterable
 from pathlib import Path
 from dateutil.parser import parse
@@ -265,10 +266,11 @@ class EC2():
         client.launch_tmux()
         return client
 
-    def script(self, scriptname, name, ip, myip=None):
-        conf_fn = 'fastec2/sync.conf'
+    def script(self, scriptname, name, myip=None, user='ubuntu', keyfile='~/.ssh/id_rsa'):
+        inst = self.get_instance(name)
+        conf_fn = 'sync.conf'
         if myip is None:
-            myip = subprocess.check_output(['curl', 'https://ipinfo.io/ip']).decode().strip()
+            myip = subprocess.check_output(['curl', '-s', 'https://ipinfo.io/ip']).decode().strip()
 
         sync_tmpl = """
 settings {{
@@ -278,23 +280,27 @@ settings {{
 sync {{
    default.rsync,
    delete = false,
-   source = "fastec2/{name}",
-   target = "{myip}:fastec2/{name}"
+   source = ".",
+   target = "{ip}:fastec2/{name}"
 }}"""
 
-        path = Path.home()/'fastec2'/name
+        fpath = Path.home()/'fastec2'
+        path  = fpath/name
         path.mkdir(parents=True, exist_ok=True)
-        shutil.copy(fn, path)
+        shutil.copy(scriptname, path)
 
-        ssh = ec2.ssh(inst, user, keyfile)
+        ssh = self.ssh(inst, user, keyfile)
         ssh.send('mkdir -p ~/fastec2')
         ssh.send(f'echo {name} > ~/fastec2/current')
-        ssh.send(f'ssh-keyscan {srcip} >> ~/.ssh/known_hosts')
-        os.system(f"rsync -az {path} {user}@{ip}:fastec2/")
+        ssh.send(f'ssh-keyscan {myip} >> ~/.ssh/known_hosts')
+        ip = inst.public_ip_address
+        os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -az {path} {user}@{ip}:fastec2/")
         ssh.send(f'cd {path}')
-        ssh.write(conf_fn, sync_tmpl.format(name=name, ip=myip))
-        ssh.send(f'lsyncd {conf_fn} -pidfile /tmp/lsyncd.pid')
-        os.execvp('./'+scriptname)
+        ssh.write(f'{fpath}/{conf_fn}', sync_tmpl.format(name=name, ip=myip))
+        ssh.send(f'lsyncd ../{conf_fn} -pidfile /tmp/lsyncd.pid')
+        ssh.send(f'chmod u+x {scriptname}')
+        ssh.send(f'export FE2_DIR={path}')
+        ssh.send('./'+scriptname)
 
 def _run_ssh(ssh, cmd, pty=False):
     stdin, stdout, stderr = ssh.exec_command(cmd, get_pty=pty)

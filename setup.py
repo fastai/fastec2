@@ -30,6 +30,6 @@ setup(
     packages=["fastec2"],
     package_data={'fastec2': [ 'insttypes.txt', 'prices.csv' ]},
     entry_points={ 'console_scripts': [ 'fe2=fastec2:main'] },
-    install_requires=[ 'awscli', 'fire', 'numpy', 'pandas', 'paramiko', 'pysftp' ],
+    install_requires=[ 'boto3', 'awscli', 'fire', 'numpy', 'pandas', 'paramiko', 'pysftp' ],
 )
 
