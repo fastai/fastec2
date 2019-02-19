@@ -210,6 +210,7 @@ class EC2():
                 try:
                     s.connect((inst.public_ip_address, 22))
                     time.sleep(1)
+                    return inst
                 except (ConnectionRefusedError,BlockingIOError): time.sleep(5)
 
     def get_launch(self, name, ami, disksize, instancetype, keyname:str='default', secgroupname:str='ssh', iops:int=None, spot:bool=False):
