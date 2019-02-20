@@ -9,20 +9,29 @@ from dateutil.parser import parse
 from pkg_resources import resource_filename
 from pdb import set_trace
 
-__all__ = 'EC2 main make_filter listify'.split()
+__all__ = 'EC2 main result results make_filter listify'.split()
 
 here = os.path.abspath(os.path.dirname(__file__)) + '/'
 
-def _get_dict(l): return collections.defaultdict(str, {o['Key']:o['Value'] for o in l})
+def snake2camel(s): return ''.join([w.title() for w in s.split('_')])
 def _make_dict(d:Dict):   return [{'Key':k, 'Value':  v } for k,v in (d or {}).items()]
+def _get_dict(l):
+    if l is None: return None
+    return collections.defaultdict(str, {o['Key']:o['Value'] for o in l})
 
-boto3.resources.base.ServiceResource.name = property(
-    lambda o: _get_dict(o.tags)['Name'])
+def _boto3_name(self):
+    d = _get_dict(self.tags)
+    return None if d is None else d['Name']
+boto3.resources.base.ServiceResource.name = property(_boto3_name)
 
 def _boto3_repr(self):
     clname =  self.__class__.__name__
     if clname == 'ec2.Instance':
         return f'{self.name} ({self.id} {self.instance_type} {self.state["Name"]}): {self.public_ip_address or "No public IP"}'
+    elif clname == 'ec2.Volume':
+        return f'{self.name} ({self.id} {self.state}): {self.size}GB'
+    elif clname == 'ec2.Snapshot':
+        return f'{self.name} ({self.id} {self.state}): {self.volume_size}GB'
     elif clname == 'ec2.Image':
         root_dev = [o for o in self.block_device_mappings if self.root_device_name == o['DeviceName']]
         return f'{self.name} ({self.id}): {root_dev[0]["Ebs"]["VolumeSize"]}GB'
@@ -51,9 +60,15 @@ def make_filter(d:Dict):
     d = {k.replace('_','-'):v for k,v in d.items()}
     return {'Filters': [{'Name':k, 'Values':listify(v)} for k,v in (d or {}).items()]}
 
-def _result(r):
+def results(r):
     if isinstance(r, typing.List): r = r[0]
-    k = [o for o in r.keys() if r !='ResponseMetadata']
+    return {o:r[o] for o in r.keys() if o !='ResponseMetadata'}
+    if not k: return None
+    return r[k[0]]
+
+def result(r):
+    if isinstance(r, typing.List): r = r[0]
+    k = [o for o in r.keys() if o !='ResponseMetadata']
     if not k: return None
     return r[k[0]]
 
@@ -84,6 +99,9 @@ class EC2():
         coll = getattr(self._ec2r,coll_name)
         return coll.filter(**make_filter(filters))
 
+    def print_resources(self, coll_name, **filters):
+        for o in self._resources(coll_name, **filters): print(o)
+
     def resource(self, coll_name, **filters):
         "The first resource from collection `coll_name` matching `filters`"
         try: return next(iter(self._resources(coll_name, **filters)))
@@ -97,7 +115,7 @@ class EC2():
 
     def _describe(self, f:str, d:Dict=None, **kwargs):
         "Calls `describe_{f}` with filter `d` and `kwargs`"
-        return _result(getattr(self._ec2, 'describe_'+f)(**make_filter(d), **kwargs))
+        return result(getattr(self._ec2, 'describe_'+f)(**make_filter(d), **kwargs))
 
     def instances(self):
         "Print all non-terminated instances"
@@ -125,13 +143,15 @@ class EC2():
         prices = dict(pd.read_csv(here+'prices.csv').values)
         return [(o,round(prices[o],3)) for o in self.insttypes[insttype]]
 
-    def waitfor(self, which, timeout, **filt):
-        waiter = self._ec2.get_waiter(which)
+    def waitfor(self, resource, event, ident, timeout=180):
+        waiter = self._ec2.get_waiter(f'{resource}_{event}')
         waiter.config.max_attempts = timeout//15
+        filt = {f'{snake2camel(resource)}Ids': [ident]}
         waiter.wait(**filt)
+        time.sleep(5)
 
     def get_secgroup(self, secgroupname):
-        "Get security group id from `secgroupname`, creating it if needed (with just port 22 ingress)"
+        "Get security group from `secgroupname`, creating it if needed (with just port 22 ingress)"
         try: secgroup = self.resource('security_groups', group_name=secgroupname)
         except KeyError:
             vpc = self.resource('vpcs', isDefault='true')
@@ -171,12 +191,63 @@ class EC2():
 
     def ami(self, aminame=None): print(self.get_ami(aminame))
 
-    def change_type(self, name, insttype):
-        inst = self.get_instance(name)
+    def create_volume(self, ssh, size=None, name=None, snapshot=None):
+        inst = ssh.inst
+        if name is None: name=inst.name
+        if snapshot is None:
+            if size is None: raise Exception('Must pass snapshot or size')
+        else:
+            snapshot = self.get_snapshot(snapshot)
+            if size is None: size = snapshot.volume_size
+        az = inst.placement['AvailabilityZone']
+        vol = self._ec2r.create_volume(AvailabilityZone=az, Size=size,
+                                       SnapshotId=snapshot.id if snapshot else None)
+        vol.create_tags(Tags=_make_dict({'Name':name}))
+        self.waitfor('volume','available', vol.id)
+        self.attach_volume(inst, vol)
+        if snapshot is None: ssh.setup_vol(vol)
+        else: ssh.mount(vol)
+        return vol
+
+    def create_snapshot(self, vol, name=None, wait=True):
+        if name is None: name=vol.name
+        snap = vol.create_snapshot()
+        snap.create_tags(Tags=_make_dict({'Name':name}))
+        if wait: self.waitfor('snapshot', 'completed', snap.id)
+        return snap
+
+    def _get_resource(self, o, cname, pref):
+        if o.__class__.__name__ == f'ec2.{cname}': return o
+        coll_name = f'{cname.lower()}s'
+        if o.startswith(f'{pref}-'):
+            return self.resource(coll_name, **{f'{cname.lower()}_id': o})
+        return self.resource(coll_name, **{'tag:Name':o})
+
+    def get_snapshot(self, snap): return self._get_resource(snap, 'Snapshot', 'snap')
+    def get_volume(self, vol): return self._get_resource(vol, 'Volume', 'vol')
+    def get_instance(self, inst): return self._get_resource(inst, 'Instance', 'i')
+
+    def mount_volume(self, ssh, vol):
+        vol = self.get_volume(vol)
+        inst = ssh.inst
+        self.attach_volume(inst, vol)
+        ssh.mount(vol)
+
+    def attach_volume(self, inst, vol):
+        inst = self.get_instance(inst)
+        vol.attach_to_instance(Device='/dev/sdh',InstanceId=inst.id)
+        self.waitfor('volume', 'in_use', vol.id)
+
+    def detach_volume(self, vol, wait=True):
+        vol.detach_from_instance()
+        if wait: self.waitfor('volume', 'available', vol.id)
+
+    def change_type(self, inst, insttype):
+        inst = self.get_instance(inst)
         inst.modify_attribute(Attribute='instanceType', Value=insttype)
 
-    def freeze(self, name):
-        inst = self.get_instance(name)
+    def freeze(self, inst):
+        inst = self.get_instance(inst)
         return self._ec2.create_image(InstanceId=inst.id, Name=name)['ImageId']
 
     def _launch_spec(self, ami, keyname, disksize, instancetype, secgroupid, iops=None):
@@ -190,13 +261,12 @@ class EC2():
 
     def request_spot(self, ami, keyname, disksize, instancetype, secgroupid, iops=None):
         spec = self._launch_spec(ami, keyname, disksize, instancetype, secgroupid, iops)
-        sr = _result(self._ec2.request_spot_instances(LaunchSpecification=spec))
+        sr = result(self._ec2.request_spot_instances(LaunchSpecification=spec))
         assert len(sr)==1, 'spot request failed'
         srid = sr[0]['SpotInstanceRequestId']
-        try: self.waitfor('spot_instance_request_fulfilled', 180, SpotInstanceRequestIds=[srid])
+        try: self.waitfor('spot_instance_request', 'fulfilled', srid)
         except: raise Exception(self._describe('spot_instance_requests',
                 {'spot-instance-request-id':srid})[0]['Fault']['Message']) from None
-        time.sleep(5)
         instid = self._describe('spot_instance_requests', {'spot-instance-request-id':srid})[0]['InstanceId']
         return self._ec2r.Instance(instid)
 
@@ -205,7 +275,7 @@ class EC2():
         return self._ec2r.create_instances(MinCount=1, MaxCount=1, **spec)[0]
 
     def _wait_ssh(self, inst):
-        self.waitfor('instance_running', 180, InstanceIds=[inst.id])
+        self.waitfor('instance', 'running', inst.id)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             for i in range(720//5):
                 try:
@@ -214,7 +284,8 @@ class EC2():
                     return inst
                 except (ConnectionRefusedError,BlockingIOError): time.sleep(5)
 
-    def get_launch(self, name, ami, disksize, instancetype, keyname:str='default', secgroupname:str='ssh', iops:int=None, spot:bool=False):
+    def get_launch(self, name, ami, disksize, instancetype, keyname:str='default', secgroupname:str='ssh',
+                   iops:int=None, spot:bool=False):
         "Creates new instance `name` and returns `Instance` object"
         insts = self._describe('instances', {'tag:Name':name})
         assert not insts, 'name already exists'
@@ -224,51 +295,46 @@ class EC2():
         inst.create_tags(Tags=_make_dict({'Name':name}))
         return self._wait_ssh(inst)
 
-    def launch(self, name, ami, disksize, instancetype, keyname:str='default', secgroupname:str='ssh', iops:int=None, spot:bool=False):
+    def launch(self, name, ami, disksize, instancetype, keyname:str='default',
+               secgroupname:str='ssh', iops:int=None, spot:bool=False):
         print(self.get_launch(name, ami, disksize, instancetype, keyname, secgroupname, iops, spot))
 
-    def get_instance(self, name:str):
-        "Get `Instance` object for `name`"
-        if name.__class__.__name__ == 'ec2.Instance': return name
-        filt = make_filter({'tag:Name':name})
-        return next(iter(self._ec2r.instances.filter(**filt)))
+    def instance(self, inst:str):
+        "Show `Instance` details for `inst`"
+        print(self.get_instance(inst))
 
-    def instance(self, name:str):
-        "Show `Instance` details for `name`"
-        print(self.get_instance(name))
-
-    def start(self, name, show=True):
-        "Starts instance `name`"
-        inst = self.get_instance(name)
+    def start(self, inst, show=True):
+        "Starts instance `inst`"
+        inst = self.get_instance(inst)
         inst.start()
         self._wait_ssh(inst)
         if show: print(inst)
         else: return inst
 
-    def terminate(self, name):
-        "Starts instance `name`"
-        inst = self.get_instance(name)
+    def terminate(self, inst):
+        "Starts instance `inst`"
+        inst = self.get_instance(inst)
         inst.terminate()
         self._ec2.delete_tags(Resources=[inst.id],Tags=[{"Key": 'Name'}])
 
-    def stop(self, name):
-        "Stops instance `name`"
-        self.get_instance(name).stop()
+    def stop(self, inst):
+        "Stops instance `inst`"
+        self.get_instance(inst).stop()
 
-    def connect(self, name, ports=None, user=None):
-        """Replace python process with an ssh process connected to instance `name`;
+    def connect(self, inst, ports=None, user=None):
+        """Replace python process with an ssh process connected to instance `inst`;
         use `user@name` otherwise defaults to user 'ubuntu'. `ports` (int or list) creates tunnels"""
         if user is None:
-            if isinstance(name,str) and '@' in name: user,name = name.split('@')
+            if isinstance(inst,str) and '@' in inst: user,inst = inst.split('@')
             else: user = 'ubuntu'
-        inst = self.get_instance(name)
+        inst = self.get_instance(inst)
         tunnel = []
         if ports is not None: tunnel = [f'-L {o}:localhost:{o}' for o in listify(ports)]
         os.execvp('ssh', ['ssh', f'{user}@{inst.public_ip_address}', *tunnel])
 
-    def ssh(self, name, user='ubuntu', keyfile='~/.ssh/id_rsa'):
-        "Return a paramiko ssh connection objected connected to instance `name`"
-        inst = self.get_instance(name)
+    def ssh(self, inst, user='ubuntu', keyfile='~/.ssh/id_rsa'):
+        "Return a paramiko ssh connection objected connected to instance `inst`"
+        inst = self.get_instance(inst)
         keyfile = os.path.expanduser(keyfile)
         key = paramiko.RSAKey.from_private_key_file(keyfile)
         client = paramiko.SSHClient()
@@ -276,13 +342,15 @@ class EC2():
         client.connect(hostname=inst.public_ip_address, username=user, pkey=key)
         client.raise_stderr = True
         client.launch_tmux()
+        client.inst = inst
         return client
 
-    def script(self, scriptname, name, myip=None, user='ubuntu', keyfile='~/.ssh/id_rsa'):
-        inst = self.get_instance(name)
+    def script(self, scriptname, inst, myip=None, user='ubuntu', keyfile='~/.ssh/id_rsa'):
+        inst = self.get_instance(inst)
+        name = inst.name
         conf_fn = 'sync.conf'
         if myip is None:
-            myip = subprocess.check_output(['curl', '-s', 'https://ipinfo.io/ip']).decode().strip()
+            myip = subprocess.check_output(['curl', '-s', 'http://169.254.169.254/latest/meta-data/public-ipv4']).decode().strip()
 
         sync_tmpl = """
 settings {{
@@ -328,6 +396,29 @@ def _check_ssh(ssh): assert ssh.run('echo hi')[0] == 'hi\n'
 
 def _write_ssh(ssh, fn, s): ssh.open_sftp().open(fn, 'w').write(s)
 
+def _volid_to_dev(ssh, vol):
+    volid = vol.id.split('-')[1]
+    res = ssh.run(f'readlink -f /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol{volid}').strip()
+    assert '/dev/disk/by-id/' not in res, 'Failed to find volume link; is it attached?'
+    return res
+
+def _setup_vol(ssh, vol):
+    dev = _volid_to_dev(ssh, vol)
+    cmds = [
+        f'sudo mkfs -q -t ext4 {dev}',
+        f'sudo mkdir -p /mnt/fe2_disk',
+        f'sudo mount {dev} /mnt/fe2_disk',
+        f'sudo chown -R ubuntu /mnt/fe2_disk',
+    ]
+    for c in cmds: ssh.run(c)
+    ssh.write('/mnt/fe2_disk/chk', 'ok')
+
+def _mount(ssh, vol):
+    dev = _volid_to_dev(ssh, vol)
+    ssh.run(f'sudo mount {dev} /mnt/fe2_disk')
+
+def _umount(ssh): ssh.run('sudo umount /mnt/fe2_disk')
+
 def _launch_tmux(ssh):
     try: ssh.run('tmux ls')
     except: ssh.run('tmux new -n 0 -d', pty=True)
@@ -342,6 +433,9 @@ paramiko.SSHClient.check = _check_ssh
 paramiko.SSHClient.send = _send_tmux
 paramiko.SSHClient.write = _write_ssh
 paramiko.SSHClient.launch_tmux = _launch_tmux
+paramiko.SSHClient.mount = _mount
+paramiko.SSHClient.umount = _umount
+paramiko.SSHClient.setup_vol = _setup_vol
 
 def _pysftp_init(self, transport):
     self._sftp_live = True
