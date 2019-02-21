@@ -95,12 +95,15 @@ class EC2():
         self._ec2r = boto3.resource('ec2')
         self.insttypes = _get_insttypes()
 
-    def _resources(self, coll_name, **filters):
+    def _resources(self, coll_name, owned=None, **filters):
         coll = getattr(self._ec2r,coll_name)
-        return coll.filter(**make_filter(filters))
+        filt = make_filter(filters)
+        if owned: filt['OwnerIds']=['self']
+        return coll.filter(**filt)
 
-    def print_resources(self, coll_name, **filters):
-        for o in self._resources(coll_name, **filters): print(o)
+    def print_resources(self, coll_name, owned=None, **filters):
+        print(f'-- {coll_name.title()} --')
+        for o in self._resources(coll_name, owned=owned, **filters): print(o)
 
     def resource(self, coll_name, **filters):
         "The first resource from collection `coll_name` matching `filters`"
@@ -178,16 +181,19 @@ class EC2():
         Sorted by `creation_date` descending"""
         for ami in self.get_amis(description, owner, filt_func): print(ami)
 
-    def get_ami(self, aminame=None):
-        "Look up `aminame` if provided, otherwise find latest Ubuntu 18.04 image"
+    def get_ami(self, ami=None):
+        "Look up `ami` if provided, otherwise find latest Ubuntu 18.04 image"
+        if ami is None:
+            amis = self.get_amis('Canonical, Ubuntu, 18.04 LTS*',owner='099720109477',
+                                  filt_func=lambda o: not re.search(r'UNSUPPORTED|minimal', o.description))
+            assert amis, 'AMI not found'
+            return amis[0]
+
+        if ami.__class__.__name__ == f'ec2.Image': return ami
         # If passed a valid AMI id, just return it
-        try: return self.resource('images', image_id=aminame)
+        try: return self.resource('images', image_id=ami)
         except KeyError: pass
-        if aminame: return self.resource('images', name=aminame, is_public='false')
-        amis = self.get_amis('Canonical, Ubuntu, 18.04 LTS*',owner='099720109477',
-                              filt_func=lambda o: not re.search(r'UNSUPPORTED|minimal', o.description))
-        assert amis, 'AMI not found'
-        return amis[0]
+        if ami: return self.resource('images', name=ami, is_public='false')
 
     def ami(self, aminame=None): print(self.get_ami(aminame))
 
@@ -200,8 +206,8 @@ class EC2():
             snapshot = self.get_snapshot(snapshot)
             if size is None: size = snapshot.volume_size
         az = inst.placement['AvailabilityZone']
-        vol = self._ec2r.create_volume(AvailabilityZone=az, Size=size,
-                                       SnapshotId=snapshot.id if snapshot else None)
+        xtra = {'SnapshotId':snapshot.id} if snapshot else {}
+        vol = self._ec2r.create_volume(AvailabilityZone=az, Size=size, **xtra)
         vol.create_tags(Tags=_make_dict({'Name':name}))
         self.waitfor('volume','available', vol.id)
         self.attach_volume(inst, vol)
@@ -209,7 +215,7 @@ class EC2():
         else: ssh.mount(vol)
         return vol
 
-    def create_snapshot(self, vol, name=None, wait=True):
+    def create_snapshot(self, vol, name=None, wait=False):
         if name is None: name=vol.name
         snap = vol.create_snapshot()
         snap.create_tags(Tags=_make_dict({'Name':name}))
@@ -341,8 +347,8 @@ class EC2():
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(hostname=inst.public_ip_address, username=user, pkey=key)
         client.raise_stderr = True
-        client.launch_tmux()
         client.inst = inst
+        client.launch_tmux()
         return client
 
     def script(self, scriptname, inst, myip=None, user='ubuntu', keyfile='~/.ssh/id_rsa'):
@@ -419,14 +425,25 @@ def _mount(ssh, vol):
 
 def _umount(ssh): ssh.run('sudo umount /mnt/fe2_disk')
 
-def _launch_tmux(ssh):
-    try: ssh.run('tmux ls')
-    except: ssh.run('tmux new -n 0 -d', pty=True)
+def _launch_tmux(ssh, name=None):
+    if name is None: name=ssh.inst.name
+    try:
+        r = ssh.run(f'tmux ls | grep {name}')
+        if r: return ssh
+    except: pass
+    ssh.run(f'tmux new -s {name} -n {name} -d', pty=True)
     return ssh
 
 def _send_tmux(ssh, cmd):
     ssh.run(f'tmux send-keys -l {shlex.quote(cmd)}')
     ssh.run(f'tmux send-keys Enter')
+
+def _ssh_runscript(ssh, script):
+    ssh.write('/tmp/tmp.sh', script)
+    ssh.run('chmod u+x /tmp/tmp.sh')
+    res = ssh.run('/tmp/tmp.sh')
+    ssh.run('rm /tmp/tmp.sh')
+    return res
 
 paramiko.SSHClient.run = _run_ssh
 paramiko.SSHClient.check = _check_ssh
@@ -436,10 +453,11 @@ paramiko.SSHClient.launch_tmux = _launch_tmux
 paramiko.SSHClient.mount = _mount
 paramiko.SSHClient.umount = _umount
 paramiko.SSHClient.setup_vol = _setup_vol
+paramiko.SSHClient.runscript = _ssh_runscript
 
-def _pysftp_init(self, transport):
+def _pysftp_init(self, ssh):
     self._sftp_live = True
-    self._transport = transport
+    self._transport = ssh.get_transport()
     self._sftp = paramiko.SFTPClient.from_transport(self._transport)
 
 def _put_dir(sftp, fr, to):
