@@ -253,8 +253,8 @@ class EC2():
         inst.modify_attribute(Attribute='instanceType', Value=insttype)
 
     def freeze(self, inst, name=None):
-        if name is None: name=inst.name
         inst = self.get_instance(inst)
+        if name is None: name=inst.name
         return self._ec2.create_image(InstanceId=inst.id, Name=name)['ImageId']
 
     def _launch_spec(self, ami, keyname, disksize, instancetype, secgroupid, iops=None):
