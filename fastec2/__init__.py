@@ -102,7 +102,6 @@ class EC2():
         return coll.filter(**filt)
 
     def print_resources(self, coll_name, owned=None, **filters):
-        print(f'-- {coll_name.title()} --')
         for o in self._resources(coll_name, owned=owned, **filters): print(o)
 
     def resource(self, coll_name, **filters):
@@ -174,6 +173,7 @@ class EC2():
         if description is not None: filt['description'] = description
         amis = self._resources('images', **filt)
         amis = [o for o in amis if filt_func(o)]
+        if owner is None: amis = [o for o in amis if o.product_codes is None]
         return sorted(amis, key=lambda o: parse(o.creation_date), reverse=True)
 
     def amis(self, description=None, owner=None, filt_func=None):
@@ -252,7 +252,8 @@ class EC2():
         inst = self.get_instance(inst)
         inst.modify_attribute(Attribute='instanceType', Value=insttype)
 
-    def freeze(self, inst):
+    def freeze(self, inst, name=None):
+        if name is None: name=inst.name
         inst = self.get_instance(inst)
         return self._ec2.create_image(InstanceId=inst.id, Name=name)['ImageId']
 
@@ -466,7 +467,7 @@ def _put_dir(sftp, fr, to):
 
 def _put_key(sftp, name):
     sftp.put(os.path.expanduser(f'~/.ssh/{name}'), f'.ssh/{name}')
-    sftp.chmod(f'.ssh/{name}', 400)
+    sftp.chmod(f'.ssh/{name}', 600)
 
 pysftp.Connection.__init__ = _pysftp_init
 pysftp.Connection.put_dir = _put_dir
