@@ -34,7 +34,7 @@ def _boto3_repr(self):
         return f'{self.name} ({self.id} {self.state}): {self.volume_size}GB'
     elif clname == 'ec2.Image':
         root_dev = [o for o in self.block_device_mappings if self.root_device_name == o['DeviceName']]
-        return f'{self.name} ({self.id}): {root_dev[0]["Ebs"]["VolumeSize"]}GB'
+        return f'{self.name} ({self.id} {self.state}): {root_dev[0]["Ebs"]["VolumeSize"]}GB'
     else:
         identifiers = [f'{ident}={repr(getattr(self, ident))}' for ident in self.meta.identifiers]
         return f"{self.__class__.__name__}({', '.join(identifiers)})"
@@ -255,7 +255,8 @@ class EC2():
     def freeze(self, inst, name=None):
         inst = self.get_instance(inst)
         if name is None: name=inst.name
-        return self._ec2.create_image(InstanceId=inst.id, Name=name)['ImageId']
+        amiid = self._ec2.create_image(InstanceId=inst.id, Name=name)['ImageId']
+        return self.get_ami(amiid)
 
     def _launch_spec(self, ami, keyname, disksize, instancetype, secgroupid, iops=None):
         assert self._describe('key_pairs', {'key-name':keyname}), 'default key not found'
@@ -266,14 +267,18 @@ class EC2():
             'SecurityGroupIds': [secgroupid], 'KeyName': keyname,
             "BlockDeviceMappings": [{ "DeviceName": "/dev/sda1", "Ebs": ebs, }] }
 
+    def get_request(self, srid):
+        srs = self._describe('spot_instance_requests', {'spot-instance-request-id':srid})
+        if not srs: return None
+        return srs[0]
+
     def request_spot(self, ami, keyname, disksize, instancetype, secgroupid, iops=None):
         spec = self._launch_spec(ami, keyname, disksize, instancetype, secgroupid, iops)
         sr = result(self._ec2.request_spot_instances(LaunchSpecification=spec))
         assert len(sr)==1, 'spot request failed'
         srid = sr[0]['SpotInstanceRequestId']
         try: self.waitfor('spot_instance_request', 'fulfilled', srid)
-        except: raise Exception(self._describe('spot_instance_requests',
-                {'spot-instance-request-id':srid})[0]['Fault']['Message']) from None
+        except: raise Exception(self.get_request(srid)['Fault']['Message']) from None
         instid = self._describe('spot_instance_requests', {'spot-instance-request-id':srid})[0]['InstanceId']
         return self._ec2r.Instance(instid)
 
@@ -338,6 +343,12 @@ class EC2():
         tunnel = []
         if ports is not None: tunnel = [f'-L {o}:localhost:{o}' for o in listify(ports)]
         os.execvp('ssh', ['ssh', f'{user}@{inst.public_ip_address}', *tunnel])
+
+    def sshs(self, inst, user='ubuntu', keyfile='~/.ssh/id_rsa'):
+        inst = self.get_instance(inst)
+        ssh = self.ssh(inst, user=user, keyfile=keyfile)
+        ftp = pysftp.Connection(ssh)
+        return inst,ssh,ftp
 
     def ssh(self, inst, user='ubuntu', keyfile='~/.ssh/id_rsa'):
         "Return a paramiko ssh connection objected connected to instance `inst`"
@@ -435,8 +446,9 @@ def _launch_tmux(ssh, name=None):
     ssh.run(f'tmux new -s {name} -n {name} -d', pty=True)
     return ssh
 
-def _send_tmux(ssh, cmd):
-    ssh.run(f'tmux send-keys -l {shlex.quote(cmd)}')
+def _send_tmux(ssh, cmd, name=None):
+    if name is None: name=ssh.inst.name
+    ssh.run(f'tmux send-keys -t {name} -l {shlex.quote(cmd)}')
     ssh.run(f'tmux send-keys Enter')
 
 def _ssh_runscript(ssh, script):
