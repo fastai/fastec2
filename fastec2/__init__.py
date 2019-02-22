@@ -307,6 +307,8 @@ class EC2():
         inst.create_tags(Tags=_make_dict({'Name':name}))
         return self._wait_ssh(inst)
 
+    def ip(self, inst): return self.get_instance(inst).public_ip_address
+
     def launch(self, name, ami, disksize, instancetype, keyname:str='default',
                secgroupname:str='ssh', iops:int=None, spot:bool=False):
         print(self.get_launch(name, ami, disksize, instancetype, keyname, secgroupname, iops, spot))
