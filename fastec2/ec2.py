@@ -7,6 +7,7 @@ from dateutil.parser import parse
 from pkg_resources import resource_filename
 from pdb import set_trace
 from .spot import *
+from .scripts import *
 
 __all__ = 'EC2 result results snake2camel make_filter listify'.split()
 
@@ -197,7 +198,7 @@ class EC2():
 
     def ami(self, aminame=None): print(self.get_ami(aminame))
 
-    def create_volume(self, ssh, size=None, name=None, snapshot=None):
+    def create_volume(self, ssh, size=None, name=None, snapshot=None, iops=None):
         inst = ssh.inst
         if name is None: name=inst.name
         if snapshot is None:
@@ -207,6 +208,10 @@ class EC2():
             if size is None: size = snapshot.volume_size
         az = inst.placement['AvailabilityZone']
         xtra = {'SnapshotId':snapshot.id} if snapshot else {}
+        if iops:
+            xtra['Iops']=iops
+            xtra['VolumeType']='io1'
+        else: xtra['VolumeType']='gp2'
         vol = self._ec2r.create_volume(AvailabilityZone=az, Size=size, **xtra)
         self.create_name(vol.id, name)
         self.waitfor('volume','available', vol.id)
@@ -233,7 +238,7 @@ class EC2():
     def get_volume(self, vol): return self._get_resource(vol, 'Volume', 'vol')
     def get_instance(self, inst): return self._get_resource(inst, 'Instance', 'i')
     def get_request(self, srid): return SpotRequest.get(self, srid)
-    def get_request_from_instance(self, inst): return SpotRequest.from_instance(e, inst)
+    def get_request_from_instance(self, inst): return SpotRequest.from_instance(self, inst)
     def get_requests(self):
         return [SpotRequest(self, o) for o in
                 self._describe('spot_instance_requests', {'state':['open','active']})]
@@ -268,7 +273,7 @@ class EC2():
     def _launch_spec(self, ami, keyname, disksize, instancetype, secgroupid, iops=None):
         assert self._describe('key_pairs', {'key-name':keyname}), 'default key not found'
         ami = self.get_ami(ami)
-        ebs = ({'VolumeSize': disksize, 'VolumeType': 'io1', 'Iops': 6000 }
+        ebs = ({'VolumeSize': disksize, 'VolumeType': 'io1', 'Iops': iops }
                  if iops else {'VolumeSize': disksize, 'VolumeType': 'gp2'})
         return { 'ImageId': ami.id, 'InstanceType': instancetype,
             'SecurityGroupIds': [secgroupid], 'KeyName': keyname,
@@ -286,7 +291,7 @@ class EC2():
         self.create_tag(resource_id, 'Name', name)
 
     def remove_name(self, resource_id):
-        self._ec2.delete_tags(Resources=resource_id,Tags=[{"Key": 'Name'}])
+        self._ec2.delete_tags(Resources=[resource_id],Tags=[{"Key": 'Name'}])
 
     def request_spot(self, name, ami, keyname, disksize, instancetype, secgroupid, iops=None):
         spec = self._launch_spec(ami, keyname, disksize, instancetype, secgroupid, iops)
@@ -394,18 +399,6 @@ class EC2():
         if myip is None:
             myip = subprocess.check_output(['curl', '-s', 'http://169.254.169.254/latest/meta-data/public-ipv4']).decode().strip()
 
-        sync_tmpl = """
-settings {{
-   logfile    = "/tmp/lsyncd.log",
-   statusFile = "/tmp/lsyncd.status",
-}}
-sync {{
-   default.rsync,
-   delete = false,
-   source = ".",
-   target = "{ip}:fastec2/{name}"
-}}"""
-
         fpath = Path.home()/'fastec2'
         path  = fpath/name
         path.mkdir(parents=True, exist_ok=True)
@@ -413,15 +406,18 @@ sync {{
 
         ssh = self.ssh(inst, user, keyfile)
         ssh.send('mkdir -p ~/fastec2')
+        ssh.send(f'export FE2_DIR=~/fastec2/{name}')
         ssh.send(f'echo {name} > ~/fastec2/current')
         ssh.send(f'ssh-keyscan {myip} >> ~/.ssh/known_hosts')
         ip = inst.public_ip_address
         os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -az {path} {user}@{ip}:fastec2/")
-        ssh.send(f'cd {path}')
-        ssh.write(f'{fpath}/{conf_fn}', sync_tmpl.format(name=name, ip=myip))
-        ssh.send(f'lsyncd ../{conf_fn} -pidfile /tmp/lsyncd.pid')
+        ssh.write(f'fastec2/{conf_fn}', sync_tmpl.format(name=name, ip=myip))
+        ssh.write('lsync.service', lsync_cfg)
+        ssh.send('sudo mv lsync.service /etc/systemd/system/')
+        ssh.send('sudo systemctl start lsync')
+        ssh.send('sudo systemctl enable lsync')
+        ssh.send(f'cd fastec2/{name}')
         ssh.send(f'chmod u+x {scriptname}')
-        ssh.send(f'export FE2_DIR={path}')
         ssh.send('./'+scriptname)
 
 def _run_ssh(ssh, cmd, pty=False):
@@ -440,7 +436,9 @@ def _write_ssh(ssh, fn, s): ssh.open_sftp().open(fn, 'w').write(s)
 
 def _volid_to_dev(ssh, vol):
     volid = vol.id.split('-')[1]
-    res = ssh.run(f'readlink -f /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol{volid}').strip()
+    try:
+        res = ssh.run(f'readlink -f /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol{volid}').strip()
+    except: return '/dev/xvdh' #XXX
     assert '/dev/disk/by-id/' not in res, 'Failed to find volume link; is it attached?'
     return res
 
@@ -457,6 +455,7 @@ def _setup_vol(ssh, vol):
 
 def _mount(ssh, vol):
     dev = _volid_to_dev(ssh, vol)
+    ssh.run(f'sudo mkdir -p /mnt/fe2_disk')
     ssh.run(f'sudo mount {dev} /mnt/fe2_disk')
 
 def _umount(ssh): ssh.run('sudo umount /mnt/fe2_disk')

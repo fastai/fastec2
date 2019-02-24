@@ -35,7 +35,7 @@ class SpotRequest():
 
     def cancel(self):
         res = ec2.result(self.e._ec2.cancel_spot_instance_requests(SpotInstanceRequestIds=[self.id]))
-        self.e.remove_name(self.name)
+        self.e.remove_name(self.id)
 
     @property
     def instance_type(self): return self.launch_specification['InstanceType']
