@@ -126,7 +126,8 @@ class EC2():
     def get_instances(self):
         "Get all non-terminated instances"
         states = ['pending', 'running', 'stopping', 'stopped']
-        return SimpleNamespace(**{o.name:o for o in self._resources('instances', instance_state_name=states)})
+        return SimpleNamespace(**{
+            (o.name or "##NONE##"):o for o in self._resources('instances', instance_state_name=states)})
 
     def instances(self):
         "Print all non-terminated instances"
