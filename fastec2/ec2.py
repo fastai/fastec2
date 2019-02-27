@@ -245,10 +245,10 @@ class EC2():
     def requests(self):
         for o in self.get_requests(): print(o)
 
-    def mount_volume(self, ssh, vol):
+    def mount_volume(self, ssh, vol, attach=True):
         vol = self.get_volume(vol)
         inst = ssh.inst
-        self.attach_volume(inst, vol)
+        if attach: self.attach_volume(inst, vol)
         ssh.mount(vol)
 
     def attach_volume(self, inst, vol):
@@ -392,6 +392,15 @@ class EC2():
         client.launch_tmux()
         return client
 
+    def setup_files(self, ssh, name, user='ubuntu'):
+        fpath = Path.home()/'fastec2'
+        ssh.send('mkdir -p ~/fastec2')
+        ssh.send(f'export FE2_DIR=~/fastec2/{name}')
+        ssh.send(f'echo {name} > ~/fastec2/current')
+        ip = ssh.inst.public_ip_address
+        os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -az {fpath/'files'}/ {user}@{ip}:fastec2/{name}/")
+        os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -az {fpath/name} {user}@{ip}:fastec2/")
+
     def script(self, scriptname, inst, myip=None, user='ubuntu', keyfile='~/.ssh/id_rsa'):
         inst = self.get_instance(inst)
         name = inst.name
@@ -400,17 +409,15 @@ class EC2():
             myip = subprocess.check_output(['curl', '-s', 'http://169.254.169.254/latest/meta-data/public-ipv4']).decode().strip()
 
         fpath = Path.home()/'fastec2'
-        path  = fpath/name
-        path.mkdir(parents=True, exist_ok=True)
-        shutil.copy(scriptname, path)
+        (fpath/name).mkdir(parents=True, exist_ok=True)
+        (fpath/'files').mkdir(parents=True, exist_ok=True)
+        os.system(f"touch {fpath}/files/setup.sh")
+        os.system(f"chmod u+x {fpath}/files/setup.sh")
+        shutil.copy(scriptname, fpath/'name')
 
         ssh = self.ssh(inst, user, keyfile)
-        ssh.send('mkdir -p ~/fastec2')
-        ssh.send(f'export FE2_DIR=~/fastec2/{name}')
-        ssh.send(f'echo {name} > ~/fastec2/current')
         ssh.send(f'ssh-keyscan {myip} >> ~/.ssh/known_hosts')
-        ip = inst.public_ip_address
-        os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -az {path} {user}@{ip}:fastec2/")
+        self.setup_files(ssh, name, user=user)
         ssh.write(f'fastec2/{conf_fn}', sync_tmpl.format(name=name, ip=myip))
         ssh.write('lsync.service', lsync_cfg)
         ssh.send('sudo mv lsync.service /etc/systemd/system/')
