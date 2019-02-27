@@ -96,6 +96,8 @@ class EC2():
         self._ec2 = boto3.client('ec2')
         self._ec2r = boto3.resource('ec2')
         self.insttypes = _get_insttypes()
+        self.typenames = SimpleNamespace(**{
+            o.replace('.','_'):o for o in sum(self.insttypes.values(), [])})
 
     def _resources(self, coll_name, owned=None, **filters):
         coll = getattr(self._ec2r,coll_name)
