@@ -2,6 +2,7 @@ import numpy as np, pandas as pd
 import boto3, re, time, typing, socket, paramiko, os, pysftp, collections, json, shlex, sys
 import inspect, subprocess, shutil
 from typing import Callable,List,Dict,Tuple,Union,Optional,Iterable
+from types import SimpleNamespace
 from pathlib import Path
 from dateutil.parser import parse
 from pkg_resources import resource_filename
@@ -120,10 +121,14 @@ class EC2():
         "Calls `describe_{f}` with filter `d` and `kwargs`"
         return result(getattr(self._ec2, 'describe_'+f)(**make_filter(d), **kwargs))
 
+    def get_instances(self):
+        "Get all non-terminated instances"
+        states = ['pending', 'running', 'stopping', 'stopped']
+        return SimpleNamespace(**{o.name:o for o in self._resources('instances', instance_state_name=states)})
+
     def instances(self):
         "Print all non-terminated instances"
-        states = ['pending', 'running', 'stopping', 'stopped']
-        for o in (self._resources('instances', instance_state_name=states)): print(o)
+        for n,o in self.get_instances().__dict__.items(): print(o)
 
     def _price_hist(self, insttype):
         types = self.insttypes[insttype]
