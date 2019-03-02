@@ -16,7 +16,7 @@ class SpotRequest():
     def from_instance(cls, e, inst):
         inst = e.get_instance(inst)
         d = e._describe('spot_instance_requests',{'instance-id':inst.id})
-        if d is None: return None
+        if not d: return None
         return cls(e, d[0])
 
     def load(self):

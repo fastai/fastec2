@@ -253,11 +253,11 @@ class EC2():
     def requests(self):
         for o in self.get_requests(): print(o)
 
-    def mount_volume(self, ssh, vol, attach=True):
+    def mount_volume(self, ssh, vol, attach=True, perm=False):
         vol = self.get_volume(vol)
         inst = ssh.inst
         if attach: self.attach_volume(inst, vol)
-        ssh.mount(vol)
+        ssh.mount(vol, perm=perm)
 
     def attach_volume(self, inst, vol):
         inst = self.get_instance(inst)
@@ -276,10 +276,13 @@ class EC2():
         inst = self.get_instance(inst)
         if name is None: name=inst.name
         amiid = self._ec2.create_image(InstanceId=inst.id, Name=name)['ImageId']
-        return self.get_ami(amiid)
+        ami = self.get_ami(amiid)
+        snid = ami.block_device_mappings[0]['Ebs']['SnapshotId']
+        self.create_name(snid, name)
+        return ami
 
     def _launch_spec(self, ami, keyname, disksize, instancetype, secgroupid, iops=None):
-        assert self._describe('key_pairs', {'key-name':keyname}), 'default key not found'
+        assert self._describe('key_pairs', {'key-name':keyname}), 'key not found'
         ami = self.get_ami(ami)
         ebs = ({'VolumeSize': disksize, 'VolumeType': 'io1', 'Iops': iops }
                  if iops else {'VolumeSize': disksize, 'VolumeType': 'gp2'})
@@ -309,6 +312,7 @@ class EC2():
         srid = sr[0]['SpotInstanceRequestId']
         try: self.waitfor('spot_instance_request', 'fulfilled', srid)
         except: raise Exception(self._get_request(srid)['Fault']['Message']) from None
+        time.sleep(5)
         sr = SpotRequest.get(self, srid)
         self.create_name(sr.id, name)
         return sr
@@ -334,11 +338,16 @@ class EC2():
         assert not insts, 'name already exists'
         secgroupid = self.get_secgroup(secgroupname).id
         if spot:
-            sr = self.request_spot  (name, ami, keyname, disksize, instancetype, secgroupid, iops)
+            sr = self.request_spot(name, ami, keyname, disksize, instancetype, secgroupid, iops)
             inst = self._ec2r.Instance(sr.instance_id)
-        else   : inst = self.request_demand(ami, keyname, disksize, instancetype, secgroupid, iops)
+        else:
+            inst = self.request_demand(ami, keyname, disksize, instancetype, secgroupid, iops)
+        self.waitfor('instance','running', inst.id)
+        inst.load()
         self.create_name(inst.id, name)
-        return self._wait_ssh(inst)
+        self._wait_ssh(inst)
+        inst.load()
+        return inst
 
     def ip(self, inst): return self.get_instance(inst).public_ip_address
 
@@ -370,16 +379,17 @@ class EC2():
         "Stops instance `inst`"
         self.get_instance(inst).stop()
 
-    def connect(self, inst, ports=None, user=None):
+    def connect(self, inst, ports=None, user=None, keyfile='~/.ssh/id_rsa'):
         """Replace python process with an ssh process connected to instance `inst`;
         use `user@name` otherwise defaults to user 'ubuntu'. `ports` (int or list) creates tunnels"""
         if user is None:
             if isinstance(inst,str) and '@' in inst: user,inst = inst.split('@')
             else: user = 'ubuntu'
         inst = self.get_instance(inst)
-        tunnel = []
-        if ports is not None: tunnel = [f'-L {o}:localhost:{o}' for o in listify(ports)]
-        os.execvp('ssh', ['ssh', f'{user}@{inst.public_ip_address}', *tunnel])
+        #tunnel = []
+        tunnel = [f'-L {o}:localhost:{o}' for o in listify(ports)]
+        os.execvp('ssh', ['ssh', f'{user}@{inst.public_ip_address}',
+                          '-i', os.path.expanduser(keyfile), *tunnel])
 
     def sshs(self, inst, user='ubuntu', keyfile='~/.ssh/id_rsa'):
         inst = self.get_instance(inst)
@@ -397,40 +407,52 @@ class EC2():
         client.connect(hostname=inst.public_ip_address, username=user, pkey=key)
         client.raise_stderr = True
         client.inst = inst
+        client.user = user
         client.launch_tmux()
         return client
 
-    def setup_files(self, ssh, name, user='ubuntu'):
+    def setup_files(self, ssh, name):
         fpath = Path.home()/'fastec2'
+        (fpath/name).mkdir(parents=True, exist_ok=True)
+        (fpath/'files').mkdir(parents=True, exist_ok=True)
+        os.system(f"touch {fpath}/files/update.sh")
+        os.system(f"chmod u+x {fpath}/files/update.sh")
+        os.system(f"touch {fpath}/files/setup.sh")
+        os.system(f"chmod u+x {fpath}/files/setup.sh")
+
         ssh.send('mkdir -p ~/fastec2')
         ssh.send(f'export FE2_DIR=~/fastec2/{name}')
         ssh.send(f'echo {name} > ~/fastec2/current')
         ip = ssh.inst.public_ip_address
-        os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -az {fpath/'files'}/ {user}@{ip}:fastec2/{name}/")
-        os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -az {fpath/name} {user}@{ip}:fastec2/")
+        os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -az {fpath/'files'}/ {ssh.user}@{ip}:fastec2/{name}/")
+        os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -az {fpath/name} {ssh.user}@{ip}:fastec2/")
 
-    def script(self, scriptname, inst, myip=None, user='ubuntu', keyfile='~/.ssh/id_rsa'):
-        inst = self.get_instance(inst)
-        name = inst.name
-        conf_fn = 'sync.conf'
+    def setup_lsync(self, ssh, name, myip, conf_fn='sync.conf'):
         if myip is None:
             myip = subprocess.check_output(['curl', '-s', 'http://169.254.169.254/latest/meta-data/public-ipv4']).decode().strip()
-
-        fpath = Path.home()/'fastec2'
-        (fpath/name).mkdir(parents=True, exist_ok=True)
-        (fpath/'files').mkdir(parents=True, exist_ok=True)
-        os.system(f"touch {fpath}/files/setup.sh")
-        os.system(f"chmod u+x {fpath}/files/setup.sh")
-        shutil.copy(scriptname, fpath/'name')
-
-        ssh = self.ssh(inst, user, keyfile)
         ssh.send(f'ssh-keyscan {myip} >> ~/.ssh/known_hosts')
-        self.setup_files(ssh, name, user=user)
-        ssh.write(f'fastec2/{conf_fn}', sync_tmpl.format(name=name, ip=myip))
-        ssh.write('lsync.service', lsync_cfg)
+        ssh.write(f'fastec2/{conf_fn}', sync_tmpl.format(user=ssh.user, name=name, ip=myip))
+        ssh.write('lsync.service', lsync_cfg.format(user=ssh.user))
+        ssh.send('cd')
         ssh.send('sudo mv lsync.service /etc/systemd/system/')
         ssh.send('sudo systemctl start lsync')
         ssh.send('sudo systemctl enable lsync')
+
+    def setup_script(self, ssh, script, path):
+        ssh.write(f'{script}', script_tmpl.format(script=script, path=path))
+        ssh.write(f'{script}.service', script_svc_tmpl.format(
+            script=script, path=path, name=ssh.inst.name, user=ssh.user))
+        ssh.send(f'sudo mv {script}.service /etc/systemd/system/')
+        ssh.send(f'sudo systemctl enable {script}')
+        ssh.send(f'echo To run: sudo systemctl start {script}')
+        ssh.send(f'echo To monitor: journalctl -f -u {script}')
+
+    def script(self, scriptname, inst, user='ubuntu', keyfile='~/.ssh/id_rsa'):
+        inst = self.get_instance(inst)
+        name = inst.name
+        ssh = self.ssh(inst, user, keyfile)
+        self.setup_files(ssh, name)
+        shutil.copy(scriptname, fpath/'name')
         ssh.send(f'cd fastec2/{name}')
         ssh.send(f'chmod u+x {scriptname}')
         ssh.send('./'+scriptname)
@@ -468,10 +490,14 @@ def _setup_vol(ssh, vol):
     for c in cmds: ssh.run(c)
     ssh.write('/mnt/fe2_disk/chk', 'ok')
 
-def _mount(ssh, vol):
+def _mount(ssh, vol, perm=False):
     dev = _volid_to_dev(ssh, vol)
     ssh.run(f'sudo mkdir -p /mnt/fe2_disk')
-    ssh.run(f'sudo mount {dev} /mnt/fe2_disk')
+    if perm:
+        ssh.run(f"echo '{dev} /mnt/fe2_disk ext4 defaults 0 0' | sudo tee -a /etc/fstab")
+        ssh.run(f'sudo mount -a')
+    else:
+        ssh.run(f'sudo mount -t ext4 {dev} /mnt/fe2_disk')
 
 def _umount(ssh): ssh.run('sudo umount /mnt/fe2_disk')
 
