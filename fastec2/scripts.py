@@ -44,6 +44,6 @@ script_tmpl = """#!/usr/bin/env bash
 
 source ~/anaconda3/etc/profile.d/conda.sh
 conda activate
-python {path}/{script}
+python {path}/{script}.py
 """
 

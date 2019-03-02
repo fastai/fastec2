@@ -440,6 +440,8 @@ class EC2():
 
     def setup_script(self, ssh, script, path):
         ssh.write(f'{script}', script_tmpl.format(script=script, path=path))
+        ssh.send(f'chmod u+x {script}')
+        ssh.send(f'mv {script} {path}/')
         ssh.write(f'{script}.service', script_svc_tmpl.format(
             script=script, path=path, name=ssh.inst.name, user=ssh.user))
         ssh.send(f'sudo mv {script}.service /etc/systemd/system/')
