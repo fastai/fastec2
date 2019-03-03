@@ -33,7 +33,7 @@ After=network.target
 [Service]
 Type=simple
 User={user}
-ExecStart={path}/{script} |& tee -a /home/{user}/fastec2/{name}/{script}.log
+ExecStart={path}/{script}.sh
 
 [Install]
 WantedBy=multi-user.target
@@ -44,6 +44,6 @@ script_tmpl = """#!/usr/bin/env bash
 
 source ~/anaconda3/etc/profile.d/conda.sh
 conda activate
-python {path}/{script}.py
+python -m fastai.launch {path}/{script}.py |& tee -a ~/fastec2/{name}/{script}.log
 """
 

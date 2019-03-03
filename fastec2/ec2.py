@@ -264,7 +264,8 @@ class EC2():
         vol.attach_to_instance(Device='/dev/sdh',InstanceId=inst.id)
         self.waitfor('volume', 'in_use', vol.id)
 
-    def detach_volume(self, vol, wait=True):
+    def detach_volume(self, ssh, vol, wait=True):
+        ssh.umount()
         vol.detach_from_instance()
         if wait: self.waitfor('volume', 'available', vol.id)
 
@@ -439,11 +440,12 @@ class EC2():
         ssh.send('sudo systemctl enable lsync')
 
     def setup_script(self, ssh, script, path):
-        ssh.write(f'{script}', script_tmpl.format(script=script, path=path))
-        ssh.send(f'chmod u+x {script}')
-        ssh.send(f'mv {script} {path}/')
+        name = ssh.inst.name
+        ssh.write(f'{script}.sh', script_tmpl.format(script=script, path=path, name=name))
+        ssh.send(f'chmod u+x {script}.sh')
+        ssh.send(f'mv {script}.sh {path}/')
         ssh.write(f'{script}.service', script_svc_tmpl.format(
-            script=script, path=path, name=ssh.inst.name, user=ssh.user))
+            script=script, path=path, name=name, user=ssh.user))
         ssh.send(f'sudo mv {script}.service /etc/systemd/system/')
         ssh.send(f'sudo systemctl enable {script}')
         ssh.send(f'echo To run: sudo systemctl start {script}')
