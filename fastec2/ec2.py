@@ -89,6 +89,7 @@ def _get_insttypes():
 
 class EC2():
     def __init__(self, region:str=None):
+        self.regions = _get_regions()
         self.curr_region = ''
         if region:
             self.curr_region = self.region(region)
@@ -115,9 +116,8 @@ class EC2():
 
     def region(self, region:str):
         "Get first region containing substring `region`"
-        regions = _get_regions()
-        if region in regions: return region
-        return next(r for r,n in regions.items() if region in n)
+        if region in self.regions: return region
+        return next(r for r,n in self.regions.items() if region in n)
 
     def _describe(self, f:str, d:Dict=None, **kwargs):
         "Calls `describe_{f}` with filter `d` and `kwargs`"
