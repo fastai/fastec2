@@ -324,13 +324,13 @@ class EC2():
 
     def _wait_ssh(self, inst):
         self.waitfor('instance', 'running', inst.id)
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            for i in range(720//5):
-                try:
+        for i in range(720//5):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     s.connect((inst.public_ip_address, 22))
                     time.sleep(1)
-                    return inst
-                except (ConnectionRefusedError,BlockingIOError): time.sleep(5)
+                return inst
+            except (ConnectionRefusedError,BlockingIOError): time.sleep(5)
 
     def get_launch(self, name, ami, disksize, instancetype, keyname:str='default', secgroupname:str='ssh',
                    iops:int=None, spot:bool=False):
