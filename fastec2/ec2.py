@@ -412,7 +412,7 @@ class EC2():
         client.launch_tmux()
         return client
 
-    def setup_files(self, ssh, name):
+    def setup_files(self, ssh, name, keyfile):
         fpath = Path.home()/'fastec2'
         (fpath/name).mkdir(parents=True, exist_ok=True)
         (fpath/'files').mkdir(parents=True, exist_ok=True)
@@ -425,8 +425,8 @@ class EC2():
         ssh.send(f'export FE2_DIR=~/fastec2/{name}')
         ssh.send(f'echo {name} > ~/fastec2/current')
         ip = ssh.inst.public_ip_address
-        os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -az {fpath/'files'}/ {ssh.user}@{ip}:fastec2/{name}/")
-        os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -az {fpath/name} {ssh.user}@{ip}:fastec2/")
+        os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no -i {keyfile}' -az {fpath/'files'}/ {ssh.user}@{ip}:fastec2/{name}/")
+        os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no -i {keyfile}' -az {fpath/name} {ssh.user}@{ip}:fastec2/")
 
     def setup_lsync(self, ssh, name, myip, conf_fn='sync.conf'):
         if myip is None:
@@ -455,8 +455,8 @@ class EC2():
         inst = self.get_instance(inst)
         name = inst.name
         ssh = self.ssh(inst, user, keyfile)
-        self.setup_files(ssh, name)
-        shutil.copy(scriptname, fpath/'name')
+        shutil.copy(scriptname, Path.home()/'fastec2'/name/scriptname)
+        self.setup_files(ssh, name, keyfile)
         ssh.send(f'cd fastec2/{name}')
         ssh.send(f'chmod u+x {scriptname}')
         ssh.send('./'+scriptname)
