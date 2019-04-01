@@ -313,8 +313,11 @@ class EC2():
         srid = sr[0]['SpotInstanceRequestId']
         try: self.waitfor('spot_instance_request', 'fulfilled', srid)
         except: raise Exception(self._get_request(srid)['Fault']['Message']) from None
-        time.sleep(5)
-        sr = SpotRequest.get(self, srid)
+        for _ in range(20):
+            time.sleep(1)
+            try:    sr = SpotRequest.get(self, srid)
+            except: sr = None
+            if sr is not None: break
         self.create_name(sr.id, name)
         return sr
 
