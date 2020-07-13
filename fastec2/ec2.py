@@ -372,7 +372,7 @@ class EC2():
         else: return inst
 
     def terminate(self, inst):
-        "Starts instance `inst`"
+        "Terminates instance `inst`"
         inst = self.get_instance(inst)
         sr = SpotRequest.from_instance(self, inst)
         if sr is not None: sr.cancel()
