@@ -40,4 +40,4 @@ Usage:       fe2 change-type NAME INSTTYPE
              fe2 change-type --name NAME --insttype INSTTYPE
 ```
 
-An [introduction and guide](https://www.fast.ai/2019/02/15/fastec2/) is available for the command line API and REPL. See the `examples` directory for examples of the Python API.
+An [introduction and guide](https://www.fast.ai/posts/2019-02-19-fastec2.html) is available for the command line API and REPL. See the `examples` directory for examples of the Python API.
